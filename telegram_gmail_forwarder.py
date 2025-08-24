@@ -146,7 +146,11 @@ def get_gmail_service(allow_authorize: bool = False):
     if not creds and allow_authorize:
         try:
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            creds = flow.run_console()
+            auth_url, _ = flow.authorization_url(prompt='consent')  # 'consent' ensures refresh token; omit if not needed
+            print(f"Please visit this URL to authorize this application: {auth_url}")
+            code = input("Enter the authorization code: ")
+            flow.fetch_token(code=code)
+            creds = flow.credentials
             TOKEN_FILE.write_text(creds.to_json())
             chmod_600(TOKEN_FILE)
             logger.info('Saved token.json')
