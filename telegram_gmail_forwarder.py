@@ -168,11 +168,7 @@ def get_gmail_service(allow_authorize: bool = False):
         explain_token()
         return None
 
-    try:
-        return build('gmail', 'v1', credentials=creds)
-    except Exception:
-        logger.exception('Failed to init Gmail API client')
-        return None
+
 
 
 def create_mime(sender: str, to: str, subject: str, body: str, attachments: Optional[List[str]] = None) -> str:
