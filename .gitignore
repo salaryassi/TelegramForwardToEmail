@@ -1,0 +1,23 @@
+# Session files
+*.session*
+
+# Credentials
+source/resources/
+config.ini
+config.py
+credentials.json
+token.json
+config.json
+
+# Cache files
+__pycache__/
+*.pyc
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# System-specific files
+.DS_Store
+Thumbs.db
+/resources/
