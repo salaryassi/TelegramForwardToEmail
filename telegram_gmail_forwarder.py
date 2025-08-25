@@ -303,6 +303,10 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
                # Extract phone number and Google code
                 dest, code = extract_google(raw_text)
 
+                # Normalize phone number with leading '+'
+                if dest and not dest.startswith('+'):
+                    dest = '+' + dest
+
                 # Only send if Google verification code exists
                 if not code:
                     logger.info('Skipped message: no Google verification code found')
@@ -321,9 +325,10 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
                     "",
                     f"Google verification code: {code}",
                     "",
-                    raw_text.splitlines()[-1]  # last line of the original message (may be in another language)
+                    "After registering a new recovery phone number, it may take up to 10 days to receive the verification codes on the new number"
                 ]
                 body = "\n".join(body_lines)
+
 
             sent = await send_email_smtp_async(sender, pwd, receiver, subject, body, attachments)
             if sent: logger.info('Email sent successfully')
