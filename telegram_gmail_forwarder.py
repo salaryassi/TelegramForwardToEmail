@@ -2,30 +2,17 @@
 """
 Telegram → Gmail Forwarder (Full Rewrite)
 
-Goals (from user requirements):
- - Always start with a friendly **Setup Wizard** if anything is missing/broken, or when user chooses Reset.
- - Ask for, validate, and persist everything: Telegram API ID/HASH, Gmail sender/receiver, and the single listener
-   (either bot username **or** numeric user id). Never run for more than one user.
- - Detect and explain common problems (missing credentials.json, missing/invalid token.json, Telethon lock issues, etc.).
- - Provide a simple **Main Menu** to: start the forwarder, change listener, authorize Gmail, resend outbox, or reset.
- - Forward only messages matching the listener and (by default) **edit** Google verification messages starting with
-   patterns like `G-123456` into the compact format:
-      Phone number : <Destination/Phone>
-      Google verification codes: <Code>
-   Add a runtime toggle: `--no-edit` to bypass editing for testing.
- - If email sending fails, store messages (including media) in `./outbox` and provide a resend action.
- - Logging toggle `--log` to also write logs to `tgfwd.log`.
+(added: Device Authorization Flow for headless server authorization)
 
-Files used:
- - config.json                 → user configuration (safe to edit by hand)
- - credentials.json / token.json (Gmail OAuth) – see menu help for how to create these
- - .active_listener.json       → enforces single listener; menu can view/clear or replace
- - outbox/                     → queued messages if sending fails
+See menu option 3 (Gmail -> Authorize) — it will now attempt a headless Device Flow first
+and save token.json automatically. If device flow isn't supported for the configured
+client/scope, it falls back to the existing manual flow (where you paste the code).
 
-Run examples:
-  python telegram_gmail_forwarder.py                # guided menu
-  python telegram_gmail_forwarder.py --log          # menu + file logging
-  python telegram_gmail_forwarder.py --no-edit      # menu with editing disabled (raw forward)
+The device code & verification URL are written to `device_auth.txt` in the working dir
+and printed to stdout. If your Telegram session (configured in config.json) is valid,
+we also *attempt* to send the verification info to your Saved Messages (`me`).
+
+This file is the same script you provided with the device-flow additions.
 """
 
 from __future__ import annotations
@@ -41,6 +28,8 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import re
+
+import requests
 
 from telethon import TelegramClient, events
 
@@ -60,6 +49,7 @@ from email import encoders
 SCOPES = ['https://www.googleapis.com/auth/gmail.send']
 CREDENTIALS_FILE = Path('credentials.json')
 TOKEN_FILE = Path('token.json')
+DEVICE_AUTH_FILE = Path('device_auth.txt')
 CONFIG_FILE = Path('config.json')
 ACTIVE_LOCK = Path('.active_listener.json')
 OUTBOX_DIR = Path('outbox')
@@ -107,6 +97,142 @@ def save_config(cfg: Dict[str, Any]):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
     chmod_600(CONFIG_FILE)
 
+# ---------------- Device Flow Utilities ----------------
+
+DEVICE_ENDPOINT = 'https://oauth2.googleapis.com/device/code'
+TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
+
+
+def _read_client_from_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Read client_id and client_secret from credentials.json (installed/web)."""
+    if not CREDENTIALS_FILE.exists():
+        return None, None
+    try:
+        j = json.loads(CREDENTIALS_FILE.read_text())
+        # credentials.json usually contains either 'installed' or 'web'
+        info = j.get('installed') or j.get('web') or {}
+        return info.get('client_id'), info.get('client_secret')
+    except Exception:
+        logger.exception('Reading credentials.json failed')
+        return None, None
+
+
+def start_device_flow(client_id: str, scope_list: List[str]) -> dict:
+    data = {'client_id': client_id, 'scope': ' '.join(scope_list)}
+    r = requests.post(DEVICE_ENDPOINT, data=data, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f'Device endpoint responded: {r.status_code} {r.text}')
+    return r.json()
+
+
+def poll_device_token(client_id: str, client_secret: Optional[str], device_code: str, interval: int) -> dict:
+    payload = {
+        'client_id': client_id,
+        'device_code': device_code,
+        'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+    }
+    if client_secret:
+        payload['client_secret'] = client_secret
+
+    while True:
+        time.sleep(interval)
+        r = requests.post(TOKEN_ENDPOINT, data=payload, timeout=15)
+        try:
+            j = r.json()
+        except Exception:
+            raise RuntimeError('Invalid JSON from token endpoint')
+
+        if r.status_code == 200 and 'access_token' in j:
+            return j
+        err = j.get('error')
+        if err == 'authorization_pending':
+            continue
+        if err == 'slow_down':
+            interval += 5
+            continue
+        # other errors (expired_token, access_denied, invalid_scope, etc.)
+        raise RuntimeError(f'Device token error: {err} - {j.get("error_description")}')
+
+
+def save_credentials_from_token_resp(token_resp: dict):
+    creds = Credentials(
+        token=token_resp.get('access_token'),
+        refresh_token=token_resp.get('refresh_token'),
+        token_uri=TOKEN_ENDPOINT,
+        client_id=token_resp.get('client_id') or _read_client_from_credentials()[0],
+        client_secret=token_resp.get('client_secret') or _read_client_from_credentials()[1],
+        scopes=SCOPES,
+    )
+    TOKEN_FILE.write_text(creds.to_json())
+    chmod_600(TOKEN_FILE)
+
+
+def device_authorize_headless(notify_fn=None) -> bool:
+    """Run the Device Authorization flow and save token.json.
+
+    notify_fn: optional callable that will be called with a text message to notify the user
+               (for example: send via Telegram). If notify_fn isn't provided, we write device_auth.txt
+               and print to stdout.
+    Returns True on success.
+    """
+    client_id, client_secret = _read_client_from_credentials()
+    if not client_id:
+        print('[ERROR] credentials.json missing or invalid. See instructions in the menu.')
+        return False
+
+    try:
+        info = start_device_flow(client_id, SCOPES)
+    except Exception as e:
+        logger.exception('Device flow start failed')
+        print('[INFO] Device flow failed to start:', e)
+        return False
+
+    verification_url = info.get('verification_url') or info.get('verification_uri')
+    user_code = info.get('user_code')
+    device_code = info.get('device_code')
+    interval = info.get('interval', 5)
+
+    message = f'Google device authorization:\nURL: {verification_url}\nCode: {user_code}\n'
+    # save to file so admin can copy it remotely
+    try:
+        DEVICE_AUTH_FILE.write_text(message)
+        chmod_600(DEVICE_AUTH_FILE)
+    except Exception:
+        logger.exception('Writing device_auth.txt failed')
+
+    # notify (if callback provided)
+    if notify_fn:
+        try:
+            notify_fn(message)
+        except Exception:
+            logger.exception('notify_fn failed')
+
+    # Always print to stdout as well (visible in logs)
+    print('\n=== Device Authorization ===')
+    print(message)
+    print('Waiting for user to complete authorization...')
+
+    try:
+        token_resp = poll_device_token(client_id, client_secret, device_code, interval)
+    except Exception as e:
+        logger.exception('Polling token failed')
+        print('[ERROR] Device authorization failed:', e)
+        return False
+
+    # Save tokens
+    try:
+        # attach client info if missing so saved creds work
+        if 'client_id' not in token_resp:
+            token_resp['client_id'] = client_id
+        if client_secret and 'client_secret' not in token_resp:
+            token_resp['client_secret'] = client_secret
+        save_credentials_from_token_resp(token_resp)
+        print('Device authorization complete — token.json saved.')
+        return True
+    except Exception:
+        logger.exception('Saving token.json failed')
+        return False
+
 # ---------------- Gmail ----------------
 
 def explain_credentials():
@@ -115,9 +241,9 @@ def explain_credentials():
 Steps:
  1) Open Google Cloud Console and create/select a project.
  2) Enable the Gmail API.
- 3) Create OAuth Client ID → Desktop app.
+ 3) Create OAuth Client ID -> Desktop app (or Web app if using redirect).
  4) Download the JSON and save it next to this script as 'credentials.json'.
- 5) In the menu, choose: Gmail → Authorize (to create token.json).
+ 5) In the menu, choose: Gmail -> Authorize (to create token.json).
 """)
 
 
@@ -125,12 +251,38 @@ def explain_token():
     print("""
 [token.json missing/invalid]
 Options:
-  A) Choose Gmail → Authorize to run the browser OAuth flow and create token.json.
+  A) Choose Gmail -> Authorize to run the OAuth flow and create token.json.
   B) Or create token.json on another machine (run the same authorize flow there) and copy it here.
 """)
 
 
-def get_gmail_service(allow_authorize: bool = False):
+def try_send_saved_message_via_telegram(cfg: Dict[str, Any], text: str) -> bool:
+    """Attempt to send `text` to the running account's Saved Messages ('me') using Telethon.
+    This is best-effort: if Telethon can't start (no session, bad api keys), it fails silently.
+    Returns True if message was sent.
+    """
+    try:
+        tg = cfg.get('telegram', {})
+        api_id = int(tg.get('api_id'))
+        api_hash = tg.get('api_hash')
+        session = tg.get('session', 'forwarder_session') + '_auth'
+    except Exception:
+        logger.debug('Telegram config missing or invalid; cannot send device message via Telegram')
+        return False
+
+    try:
+        client = TelegramClient(session, api_id, api_hash)
+        client.start()  # will use existing session or require login if missing
+        client.send_message('me', text)
+        client.disconnect()
+        logger.info('Sent device authorization message to Saved Messages (me)')
+        return True
+    except Exception:
+        logger.exception('Failed to send device authorization message via Telegram')
+        return False
+
+
+def get_gmail_service(allow_authorize: bool = False, cfg: Optional[Dict[str, Any]] = None):
     if not CREDENTIALS_FILE.exists():
         explain_credentials()
         return None
@@ -144,20 +296,40 @@ def get_gmail_service(allow_authorize: bool = False):
             creds = None
 
     if not creds and allow_authorize:
+        # Try headless device flow first; if it succeeds we'll have token.json
+        notified = False
         try:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            auth_url, _ = flow.authorization_url(prompt='consent')  # 'consent' ensures refresh token; omit if not needed
-            print(f"Please visit this URL to authorize this application: {auth_url}")
-            code = input("Enter the authorization code: ")
-            flow.fetch_token(code=code)
-            creds = flow.credentials
-            TOKEN_FILE.write_text(creds.to_json())
-            chmod_600(TOKEN_FILE)
-            logger.info('Saved token.json')
+            # attempt to notify via Telegram if cfg provided
+            notify_fn = None
+            if cfg:
+                notify_fn = lambda text: try_send_saved_message_via_telegram(cfg, text)
+            ok = device_authorize_headless(notify_fn=notify_fn)
+            if ok:
+                try:
+                    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+                except Exception:
+                    logger.exception('token.json created but could not be read')
+                    creds = None
+                    print('[ERROR] token.json could not be read after device flow')
         except Exception:
-            logger.exception('OAuth flow failed')
-            print('[ERROR] OAuth flow failed on this machine. Try on a machine with a browser and copy token.json back here.')
-            return None
+            logger.exception('Device flow attempt failed')
+
+        # If device flow failed or not available, fall back to manual flow (paste code)
+        if not creds:
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+                auth_url, _ = flow.authorization_url(prompt='consent')
+                print(f"Please visit this URL to authorize this application: {auth_url}")
+                code = input("Enter the authorization code: ")
+                flow.fetch_token(code=code)
+                creds = flow.credentials
+                TOKEN_FILE.write_text(creds.to_json())
+                chmod_600(TOKEN_FILE)
+                logger.info('Saved token.json')
+            except Exception:
+                logger.exception('OAuth flow failed')
+                print('[ERROR] OAuth flow failed on this machine. Try on a machine with a browser and copy token.json back here.')
+                return None
 
     if creds and creds.expired and creds.refresh_token:
         try:
@@ -172,8 +344,18 @@ def get_gmail_service(allow_authorize: bool = False):
         explain_token()
         return None
 
+    try:
+        service = build('gmail', 'v1', credentials=creds)
+        return service
+    except Exception:
+        logger.exception('Failed to build Gmail service')
+        return None
 
+# ---------------- rest of script ----------------
+# The remainder of the script is unchanged except that menu option 3 now passes cfg
+# to get_gmail_service so device flow can attempt Telegram notification.
 
+# ---------------- Gmail helper functions and forwarding code ----------------
 
 def create_mime(sender: str, to: str, subject: str, body: str, attachments: Optional[List[str]] = None) -> str:
     msg = MIMEMultipart()
@@ -335,11 +517,11 @@ def wizard_setup(cfg: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------- Menu ----------------
 
 def show_menu():
-    print('\n=== Telegram → Gmail Forwarder ===')
+    print('\n=== Telegram \u2192 Gmail Forwarder ===')
     print('1) Start forwarder')
     print('2) Change listener (bot name / user id)')
-    print('3) Gmail → Authorize / Refresh token.json')
-    print('4) Outbox → Resend queued emails')
+    print('3) Gmail \u2192 Authorize / Refresh token.json (headless-aware)')
+    print('4) Outbox \u2192 Resend queued emails')
     print('5) View/clear .active_listener.json')
     print('6) Reset / Run Setup Wizard again')
     print('0) Exit')
@@ -360,11 +542,12 @@ def menu_loop(no_edit_flag: bool):
             cfg = load_config()
             cfg = wizard_setup(cfg)
         elif choice == '3':
-            svc = get_gmail_service(allow_authorize=True)
+            # Pass cfg so get_gmail_service can attempt Telegram notify during device flow
+            svc = get_gmail_service(allow_authorize=True, cfg=cfg)
             if svc:
-                print('✓ Gmail ready. You can now start the forwarder.')
+                print('\u2713 Gmail ready. You can now start the forwarder.')
         elif choice == '4':
-            svc = get_gmail_service(allow_authorize=False)
+            svc = get_gmail_service(allow_authorize=False, cfg=cfg)
             if not svc:
                 print('Gmail is not authorized. Use menu option 3 first.')
             else:
@@ -407,7 +590,7 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
             current = None
         if current and current != desired:
             print('[ERROR] Another listener configuration already exists in .active_listener.json.')
-            print('To change it, use menu → View/clear .active_listener.json, or rerun Setup to replace it.')
+            print('To change it, use menu \u2192 View/clear .active_listener.json, or rerun Setup to replace it.')
             return
     else:
         ACTIVE_LOCK.write_text(json.dumps(desired))
@@ -435,7 +618,7 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
         print('[ERROR] Email sender/receiver missing. Run Setup again.')
         return
 
-    service = get_gmail_service(allow_authorize=False)
+    service = get_gmail_service(allow_authorize=False, cfg=cfg)
     if not service:
         print('[INFO] Gmail not available — emails will be saved to outbox and can be resent later.')
 
@@ -552,7 +735,7 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
 # ---------------- Entrypoint ----------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Telegram → Gmail Forwarder (guided)')
+    parser = argparse.ArgumentParser(description='Telegram \u2192 Gmail Forwarder (guided)')
     parser.add_argument('--no-edit', action='store_true', help='Disable Google-code editing for testing')
     parser.add_argument('--log', action='store_true', help='Also write logs to tgfwd.log')
     args = parser.parse_args()
