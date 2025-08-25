@@ -1,23 +1,32 @@
-# Session files
-*.session*
-
-# Credentials
-source/resources/
-config.ini
-config.py
-credentials.json
-token.json
-config.json
-
-# Cache files
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# IDE-specific files
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Logs
+*.log
+tgfwd.log
+
+# Environment files (sensitive)
+.env
+
+# Outbox folder (temporary email storage)
+outbox/
+
+# Active listener lock
+.active_listener.json
+
+# IDE / Editor configs
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
 
-# System-specific files
+# System files
 .DS_Store
 Thumbs.db
-/resources/
