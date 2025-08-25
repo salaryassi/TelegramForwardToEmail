@@ -14,19 +14,34 @@ tgfwd.log
 
 # Environment files (sensitive)
 .env
+.env.swp
 
-# Outbox folder (temporary email storage)
-outbox/
+# Config files
+config.json
+.config.json.swp
+credentials.json
+
+# Telegram session files
+*.session
+forwarder_session.session
 
 # Active listener lock
 .active_listener.json
 
-# IDE / Editor configs
-.vscode/
-.idea/
+# Editor/IDE backups
+*.save
 *.sublime-project
 *.sublime-workspace
+.vscode/
+.idea/
+
+# Outbox folder (temporary email storage)
+outbox/
 
 # System files
 .DS_Store
 Thumbs.db
+
+# Catch all Vim swap files, including weird ones like ..env.swp
+*.swp
+.*.swp
