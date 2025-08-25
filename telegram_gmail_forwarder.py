@@ -300,9 +300,30 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
             if no_edit_flag or not cfg.get('options', {}).get('edit', True):
                 body = f"From: {name}\nUsername: @{getattr(sender_obj,'username','')}\nDate: {event.message.date.isoformat()}\n\n{raw_text}"
             else:
+               # Extract phone number and Google code
                 dest, code = extract_google(raw_text)
-                if dest or code: body=format_compact(dest, code)
-                else: body=format_compact(None,None)+"\n---- Original message ----\n"+raw_text
+
+                # Only send if Google verification code exists
+                if not code:
+                    logger.info('Skipped message: no Google verification code found')
+                    return  # Do not send email
+
+                # Build the email subject and body
+                subject = "ONLY IF BUYER ALREADY ASKED FOR CODE OPEN THIS EMAIL BECAUSE IT MIGHT BE US"
+
+                # Format the email body
+                date_str = event.message.date.strftime("%a, %d %b %Y %H:%M:%S GMT")
+                body_lines = [
+                    f"phone number: {dest or '(not found)'}",
+                    f"Date: {date_str}",
+                    "",
+                    "PLEASE ONLY SEND BELOW TEXT TO THE BUYER IF HE ASKED",
+                    "",
+                    f"Google verification code: {code}",
+                    "",
+                    raw_text.splitlines()[-1]  # last line of the original message (may be in another language)
+                ]
+                body = "\n".join(body_lines)
 
             sent = await send_email_smtp_async(sender, pwd, receiver, subject, body, attachments)
             if sent: logger.info('Email sent successfully')
