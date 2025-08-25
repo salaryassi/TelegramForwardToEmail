@@ -333,10 +333,12 @@ async def start_forwarder(cfg: Dict[str, Any], no_edit_flag: bool):
             except: logger.exception('Failed to remove listener lock')
 
 # ---------------- Entrypoint ----------------
+# ---------------- Entrypoint ----------------
 def main():
     parser = argparse.ArgumentParser(description='Telegram → Gmail Forwarder (SMTP)')
     parser.add_argument('--no-edit', action='store_true', help='Disable Google-code editing')
     parser.add_argument('--log', action='store_true', help='Write logs to tgfwd.log')
+    parser.add_argument('--auto', action='store_true', help='Run directly without menu (for systemd)')
     args = parser.parse_args()
 
     if args.log:
@@ -346,7 +348,15 @@ def main():
         logger.addHandler(fh)
         logger.setLevel(logging.DEBUG)
 
-    menu_loop(no_edit_flag=args.no_edit)
+    if args.auto:
+        cfg = load_config()
+        if not cfg or not cfg.get('telegram') or not cfg.get('email'):
+            print("[ERROR] Missing config. Please run setup interactively first.")
+            sys.exit(1)
+        asyncio.run(start_forwarder(cfg, no_edit_flag=args.no_edit))
+    else:
+        menu_loop(no_edit_flag=args.no_edit)
+
 
 if __name__=='__main__':
     main()
